@@ -1,0 +1,14 @@
+# Service account keys — never commit
+customer-media-writer-key.json
+*-key.json
+*.pem
+service-account*.json
+
+# Local upload working state (optional; large / machine-specific)
+data_lake_report/gcs_upload/console.log
+data_lake_report/gcs_upload/upload.pid
+data_lake_report/gcs_upload/
+data_lake_report/gcs_upload_fast/
+data_lake_report/gcs_reorganize/
+data_lake_report/gcs_validate/
+data_lake_report/gcs_finalize/
