@@ -28,6 +28,8 @@
 #   ./reorganize_and_archive_gcs.sh --background --jobs 2
 #   ./reorganize_and_archive_gcs.sh --phases archive --jobs 2   # only move already done
 #   ./reorganize_and_archive_gcs.sh --phases reorganize --start-row 25 --jobs 2
+#   ./reorganize_and_archive_gcs.sh --gcs-only --phases reorganize,archive --start-row 55 --background --jobs 6
+#   ./reorganize_and_archive_gcs.sh --gcs-only --skip-success --start-row 55 --reorg-backend auto --jobs 2
 #
 set -euo pipefail
 
@@ -43,6 +45,8 @@ JOBS=4
 GCLOUD_PROCESSES=1
 GCLOUD_THREADS=8
 REORG_PARALLEL=16
+REORG_BACKEND=auto   # auto | gcloud | api — auto: prefix folder mv + JSON API for root files
+REORG_API_THREADS=16 # parallel HTTP moves per chunk (api/auto file moves)
 DRY_RUN=0
 BACKGROUND=0
 LIMIT=0
@@ -50,6 +54,8 @@ SKIP=0
 LOG_DIR="${SCRIPT_DIR}/data_lake_report/gcs_finalize"
 PHASES="reorganize,verify,archive"   # comma-separated
 SKIP_MISSING=1
+GCS_ONLY=0
+SKIP_SUCCESS=0
 
 # Top-level media extensions (lowercase, with dot)
 MEDIA_EXT_REGEX='\.(jpg|jpeg|png|tif|tiff|bmp|webp|heic|mp4|mov|avi|mkv|m4v|wmv|mpg|mpeg)$'
@@ -74,7 +80,10 @@ Options:
   --gcloud-processes N gcloud storage process_count per rsync/mv batch (default: ${GCLOUD_PROCESSES})
   --gcloud-threads N   gcloud storage thread_count per process (default: ${GCLOUD_THREADS})
   --reorg-parallel N   Parallel workers for in-folder reorganize mv (default: ${REORG_PARALLEL})
+  --reorg-backend MODE reorganize moves: auto (default), gcloud (legacy per-file), api
+  --reorg-api-threads N  Concurrent JSON API moves per chunk (default: ${REORG_API_THREADS})
   --phases LIST        Subset of: reorganize,verify,archive (default: ${PHASES})
+  --skip-success       Skip expected_path already listed OK in ${LOG_DIR}/success_*.tsv
   --limit N            Process only first N mapped rows after --skip (0=all)
   --skip N             Skip first N mapped rows (same order as plan/CSV); row N+1 is first processed
   --start-row N        Same as --skip N-1 (1-based plan row; e.g. --start-row 25 skips 24 rows)
@@ -82,6 +91,8 @@ Options:
   --dry-run            Plan only; no GCS mutations / no verify writes beyond logs
   --background         nohup re-launch
   --fail-missing       Fail if local folder missing (default: skip)
+  --gcs-only           No local disk: plan by expected_path only; archive compares
+                       STANDARD ↔ ARCHIVE (MD5 metadata). verify phase is not allowed.
   -h, --help           Help
 
 Throughput (same idea as upload_data_lake_to_gcs.sh):
@@ -89,6 +100,9 @@ Throughput (same idea as upload_data_lake_to_gcs.sh):
   default 4 × 1 × 8 = 32   (raise --jobs first; watch RAM)
 
 Cost tip: keep default phase order (reorganize → verify → archive).
+
+GCS-only (no DATA_LAKE on this machine):
+  ./$(basename "$0") --gcs-only --phases reorganize,archive --start-row 55 --background --jobs 6
 EOF
 }
 
@@ -106,7 +120,10 @@ while [[ $# -gt 0 ]]; do
     --gcloud-processes) GCLOUD_PROCESSES="$2"; shift 2 ;;
     --gcloud-threads) GCLOUD_THREADS="$2"; shift 2 ;;
     --reorg-parallel) REORG_PARALLEL="$2"; shift 2 ;;
+    --reorg-backend) REORG_BACKEND="$2"; shift 2 ;;
+    --reorg-api-threads) REORG_API_THREADS="$2"; shift 2 ;;
     --phases) PHASES="$2"; shift 2 ;;
+    --skip-success) SKIP_SUCCESS=1; shift ;;
     --limit) LIMIT="$2"; shift 2 ;;
     --skip) SKIP="$2"; shift 2 ;;
     --start-row)
@@ -118,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --background) BACKGROUND=1; shift ;;
     --fail-missing) SKIP_MISSING=0; shift ;;
+    --gcs-only) GCS_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -129,12 +147,16 @@ SRC_BUCKET="${SRC_BUCKET#gs://}"; SRC_BUCKET="${SRC_BUCKET%/}"
 DST_BUCKET="${DST_BUCKET#gs://}"; DST_BUCKET="${DST_BUCKET%/}"
 
 [[ -f "$CSV" ]] || die "CSV not found: $CSV"
-[[ -d "$BASE" ]] || die "BASE not found: $BASE"
 [[ -f "$CREDENTIALS" ]] || die "credentials not found: $CREDENTIALS"
+if [[ "$GCS_ONLY" -eq 0 ]]; then
+  [[ -d "$BASE" ]] || die "BASE not found: $BASE"
+fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be positive"
 [[ "$GCLOUD_PROCESSES" =~ ^[1-9][0-9]*$ ]] || die "--gcloud-processes must be positive"
 [[ "$GCLOUD_THREADS" =~ ^[1-9][0-9]*$ ]] || die "--gcloud-threads must be positive"
 [[ "$REORG_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "--reorg-parallel must be positive"
+[[ "$REORG_API_THREADS" =~ ^[1-9][0-9]*$ ]] || die "--reorg-api-threads must be positive"
+case "$REORG_BACKEND" in auto|gcloud|api) ;; *) die "--reorg-backend must be auto, gcloud, or api" ;; esac
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || die "--limit must be non-negative"
 [[ "$SKIP" =~ ^[0-9]+$ ]] || die "--skip must be non-negative"
 
@@ -151,6 +173,10 @@ for p in "${_phases[@]}"; do
   esac
 done
 [[ $((want_reorganize + want_verify + want_archive)) -gt 0 ]] || die "no phases selected"
+
+if [[ "$GCS_ONLY" -eq 1 ]]; then
+  [[ "$want_verify" -eq 0 ]] || die "--gcs-only cannot use verify (needs local disk); use --phases reorganize,archive"
+fi
 
 mkdir -p "$LOG_DIR" "$LOG_DIR/jobs" "$LOG_DIR/manifests"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -182,6 +208,9 @@ if [[ "$BACKGROUND" -eq 1 ]]; then
     --log-dir "$LOG_DIR"
   )
   [[ "$SKIP_MISSING" -eq 0 ]] && reexec+=(--fail-missing)
+  [[ "$GCS_ONLY" -eq 1 ]] && reexec+=(--gcs-only)
+  [[ "$SKIP_SUCCESS" -eq 1 ]] && reexec+=(--skip-success)
+  reexec+=(--reorg-backend "$REORG_BACKEND" --reorg-api-threads "$REORG_API_THREADS")
   : >"$MAIN_LOG"
   ln -sfn "$(basename "$MAIN_LOG")" "$LATEST_LOG"
   nohup env FINALIZE_LOG_STDOUT_ONLY=1 "${reexec[@]}" >>"$MAIN_LOG" 2>&1 &
@@ -210,18 +239,19 @@ export CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED=False
 log "=== reorganize / verify / archive ==="
 log "csv=$CSV base=$BASE"
 log "src=gs://${SRC_BUCKET}/${PREFIX}/  dst=gs://${DST_BUCKET}/${PREFIX}/"
-log "phases=$PHASES jobs=$JOBS gcloud=${GCLOUD_PROCESSES}x${GCLOUD_THREADS} reorg_parallel=$REORG_PARALLEL dry_run=$DRY_RUN skip=$SKIP start_row=$((SKIP + 1)) limit=$LIMIT"
+log "phases=$PHASES gcs_only=$GCS_ONLY jobs=$JOBS gcloud=${GCLOUD_PROCESSES}x${GCLOUD_THREADS} reorg=${REORG_BACKEND} parallel=$REORG_PARALLEL api_threads=$REORG_API_THREADS skip_success=$SKIP_SUCCESS dry_run=$DRY_RUN skip=$SKIP start_row=$((SKIP + 1)) limit=$LIMIT"
 log "approx_gcs_workers=$((JOBS * GCLOUD_PROCESSES * GCLOUD_THREADS)) (jobs×processes×threads; md5/local disk adds load)"
 log "project=$CLOUDSDK_CORE_PROJECT log=$MAIN_LOG"
 
 # ── build plan ──────────────────────────────────────────────────────────────
 PLAN_SUMMARY="$(
-python3 - "$CSV" "$BASE" "$PLAN_FILE" "$LIMIT" "$SKIP" <<'PY'
+python3 - "$CSV" "$BASE" "$PLAN_FILE" "$LIMIT" "$SKIP" "$GCS_ONLY" <<'PY'
 import csv, sys
 from pathlib import Path
-csv_path, base_s, plan_file, limit_s, skip_s = sys.argv[1:6]
+csv_path, base_s, plan_file, limit_s, skip_s, gcs_only_s = sys.argv[1:7]
 limit = int(limit_s)
 skip = int(skip_s)
+gcs_only = int(gcs_only_s) != 0
 base = Path(base_s)
 skipped_empty = 0
 skipped_by_flag = 0
@@ -234,15 +264,21 @@ with open(csv_path, newline="", encoding="utf-8") as f:
         if not expected:
             skipped_empty += 1
             continue
-        if not local:
+        if not local and not gcs_only:
             continue
         if skip > 0:
             skip -= 1
             skipped_by_flag += 1
             continue
-        src = base / local
-        status = "ok" if src.is_dir() else "missing_local"
-        rows.append((local, expected, status, str(src)))
+        if gcs_only:
+            label = local or expected
+            local_abs = "-" if not local else str(base / local)
+            status = "ok"
+            rows.append((label, expected, status, local_abs))
+        else:
+            src = base / local
+            status = "ok" if src.is_dir() else "missing_local"
+            rows.append((local, expected, status, str(src)))
         if limit and len(rows) >= limit:
             break
 with open(plan_file, "w", encoding="utf-8") as out:
@@ -251,8 +287,9 @@ with open(plan_file, "w", encoding="utf-8") as out:
         out.write("\t".join(r) + "\n")
 missing = sum(1 for r in rows if r[2] == "missing_local")
 ready = sum(1 for r in rows if r[2] == "ok")
+mode = "gcs_only" if gcs_only else "local"
 print(
-    f"kept={len(rows)} ready={ready} missing_local={missing} "
+    f"mode={mode} kept={len(rows)} ready={ready} missing_local={missing} "
     f"skipped_empty={skipped_empty} skipped_rows={skipped_by_flag}"
 )
 PY
@@ -261,7 +298,11 @@ log "plan: $PLAN_SUMMARY"
 log "plan_file=$PLAN_FILE"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  log "DRY-RUN sample mappings (local -> gs://${SRC_BUCKET}/${PREFIX}/expected -> archive):"
+  if [[ "$GCS_ONLY" -eq 1 ]]; then
+    log "DRY-RUN (gcs-only) sample mappings (expected_path on GCS -> archive):"
+  else
+    log "DRY-RUN sample mappings (local -> gs://${SRC_BUCKET}/${PREFIX}/expected -> archive):"
+  fi
   TOTAL=$(($(wc -l <"$PLAN_FILE") - 1))
   set +o pipefail
   awk -F'\t' -v sb="$SRC_BUCKET" -v db="$DST_BUCKET" -v p="$PREFIX" -v skip="$SKIP" 'NR==1{next} {
@@ -281,6 +322,27 @@ if [[ "$SKIP_MISSING" -eq 0 ]]; then
 fi
 
 awk -F'\t' 'NR==1{next} $3=="ok"{print $1"\t"$2"\t"$4}' "$PLAN_FILE" >"$READY_FILE"
+
+if [[ "$SKIP_SUCCESS" -eq 1 ]]; then
+  SKIP_SUCCESS_SET="${LOG_DIR}/skip_success_paths_${RUN_ID}.txt"
+  : >"$SKIP_SUCCESS_SET"
+  shopt -s nullglob
+  for sf in "$LOG_DIR"/success_*.tsv; do
+    awk -F'\t' 'NR>1 && $1=="OK"{print $3}' "$sf" >>"$SKIP_SUCCESS_SET"
+  done
+  shopt -u nullglob
+  sort -u -o "$SKIP_SUCCESS_SET" "$SKIP_SUCCESS_SET"
+  SKIP_SUCCESS_N="$(wc -l <"$SKIP_SUCCESS_SET" | tr -d ' ')"
+  if [[ "$SKIP_SUCCESS_N" -gt 0 ]]; then
+    READY_FILTERED="${READY_FILE}.filtered"
+    awk -F'\t' 'NR==FNR{skip[$1]=1; next} !skip[$2]' "$SKIP_SUCCESS_SET" "$READY_FILE" >"$READY_FILTERED"
+    mv "$READY_FILTERED" "$READY_FILE"
+    log "skip_success_paths=$SKIP_SUCCESS_N (from success_*.tsv in $LOG_DIR)"
+  else
+    log "skip_success: no prior success_*.tsv entries found"
+  fi
+fi
+
 READY_COUNT="$(wc -l <"$READY_FILE" | tr -d ' ')"
 log "ready=$READY_COUNT"
 [[ "$READY_COUNT" -gt 0 ]] || die "nothing to process"
@@ -313,13 +375,142 @@ append_result() {
     "$([[ "$status" == OK ]] && echo "$RESULTS_OK" || echo "$RESULTS_FAIL")"
 }
 
-# Run many same-bucket mv ops in one gcloud process (avoids per-file Python startup).
-reorganize_mv_chunk() {
+# Legacy: one gcloud storage mv subprocess per object (slow; use --reorg-backend auto).
+reorganize_mv_chunk_gcloud() {
   local chunk_file="$1"
   while IFS=$'\t' read -r src dst; do
     [[ -n "$src" && -n "$dst" ]] || continue
     gcloud storage mv "$src" "$dst" --quiet --continue-on-error || return 1
   done <"$chunk_file"
+}
+
+# One gcloud auth + parallel Storage JSON API objects.move (same bucket).
+reorganize_mv_chunk_api() {
+  local chunk_file="$1"
+  python3 - "$chunk_file" "$SRC_BUCKET" "$REORG_API_THREADS" <<'PY'
+import concurrent.futures
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+chunk_file, bucket, threads_s = sys.argv[1:4]
+threads = max(1, int(threads_s))
+
+def token():
+    env = os.environ.copy()
+    return subprocess.check_output(
+        ["gcloud", "auth", "print-access-token"],
+        env=env,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).strip()
+
+def obj_from_gs(uri: str) -> str:
+    assert uri.startswith("gs://"), uri
+    rest = uri[5:]
+    b, _, name = rest.partition("/")
+    if b != bucket:
+        raise ValueError(f"unexpected bucket in {uri}")
+    return name
+
+def object_exists(tok: str, obj_name: str) -> bool:
+    enc = urllib.parse.quote(obj_name, safe="")
+    url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{enc}"
+    req = urllib.request.Request(
+        url, method="GET", headers={"Authorization": f"Bearer {tok}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+def move_one(tok: str, src: str, dst: str):
+    src_obj = obj_from_gs(src)
+    dst_obj = obj_from_gs(dst)
+    if not object_exists(tok, src_obj):
+        if object_exists(tok, dst_obj):
+            return None  # idempotent: already at destination (partial prior run)
+        return f"missing source and destination: {src_obj}"
+    enc_src = urllib.parse.quote(src_obj, safe="")
+    enc_dst = urllib.parse.quote(dst_obj, safe="")
+    url = (
+        f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
+        f"{enc_src}/moveTo/o/{enc_dst}"
+    )
+    req = urllib.request.Request(
+        url, method="POST", headers={"Authorization": f"Bearer {tok}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            resp.read()
+        return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        if e.code == 404 and object_exists(tok, dst_obj):
+            return None
+        return f"HTTP {e.code}: {body[:240]}"
+
+pairs = []
+with open(chunk_file, encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        src, dst = line.split("\t", 1)
+        pairs.append((src, dst))
+if not pairs:
+    sys.exit(0)
+
+tok = token()
+fail = 0
+with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+    futs = {pool.submit(move_one, tok, s, d): (s, d) for s, d in pairs}
+    for fut in concurrent.futures.as_completed(futs):
+        err = fut.result()
+        if err:
+            s, d = futs[fut]
+            print(f"  FAIL  move {s} -> {d}: {err}", file=sys.stderr)
+            fail += 1
+sys.exit(1 if fail else 0)
+PY
+}
+
+reorganize_mv_chunk() {
+  local chunk_file="$1"
+  case "$REORG_BACKEND" in
+    gcloud) reorganize_mv_chunk_gcloud "$chunk_file" ;;
+    api|auto) reorganize_mv_chunk_api "$chunk_file" ;;
+    *) die "unknown REORG_BACKEND: $REORG_BACKEND" ;;
+  esac
+}
+
+# Move an entire first-level folder to analysis/ in one gcloud invocation.
+# Return 2 if analysis/${top_dir}/ already exists (partial prior run) — caller uses per-file mv.
+reorganize_prefix_move() {
+  local week_prefix="$1"
+  local top_dir="$2"
+  local src="gs://${SRC_BUCKET}/${week_prefix}/${top_dir}"
+  local dst="gs://${SRC_BUCKET}/${week_prefix}/analysis/${top_dir}"
+  local src_n dst_n
+  src_n="$(gcloud storage objects list "${src}/**" --format='value(name)' 2>/dev/null | wc -l | tr -d ' ')"
+  dst_n="$(gcloud storage objects list "${dst}/**" --format='value(name)' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$src_n" -eq 0 ]]; then
+    echo "  INFO  prefix skip ${top_dir}/ (source empty; tree likely already under analysis/)"
+    return 0
+  fi
+  if [[ "$dst_n" -gt 0 ]]; then
+    echo "  WARN  prefix skip ${top_dir}/ (analysis/${top_dir}/ has ${dst_n} object(s); per-file mv avoids detections/detections nesting)"
+    return 2
+  fi
+  echo "  INFO  reorganize prefix mv: ${top_dir}/ -> analysis/${top_dir}/ (bulk, ${src_n} object(s))"
+  gcloud storage mv "$src" "$dst" --quiet --continue-on-error
 }
 
 reorganize_one() {
@@ -328,6 +519,9 @@ reorganize_one() {
   local src_uri="gs://${SRC_BUCKET}/${week_prefix}"
   local list_file="$2"
   local moved_media=0 moved_analysis=0 skipped=0
+  local use_prefix_bulk=0
+  [[ "$REORG_BACKEND" == auto || "$REORG_BACKEND" == gcloud ]] && use_prefix_bulk=1
+  [[ "$REORG_BACKEND" == gcloud ]] && use_prefix_bulk=0  # legacy: per-file only
 
   gcloud storage objects list "${src_uri}/**" \
     --format='value(name)' >"$list_file" 2>/dev/null || true
@@ -338,22 +532,40 @@ reorganize_one() {
   fi
 
   local mv_list="${list_file}.mv"
+  local nested_list="${list_file}.nested"
   : >"$mv_list"
-  local name rel dest
+  : >"$nested_list"
+  declare -A has_nested=()
+  declare -A root_file=()
+  local name rel dest top fail=0 fix_top fix_rest rc=0
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
-    # name is bucket-relative: data-lake/expected/...
     case "$name" in
       "${week_prefix}/"*) rel="${name#${week_prefix}/}" ;;
       *) continue ;;
     esac
     [[ -n "$rel" ]] || continue
-
-    # Already finalized layout
+    # Fix double-nest from mistaken prefix mv when analysis/DIR/ already existed.
+    if [[ "$rel" =~ ^analysis/([^/]+)/\1/(.+)$ ]]; then
+      fix_top="${BASH_REMATCH[1]}"
+      fix_rest="${BASH_REMATCH[2]}"
+      printf '%s\t%s\n' \
+        "gs://${SRC_BUCKET}/${name}" \
+        "gs://${SRC_BUCKET}/${week_prefix}/analysis/${fix_top}/${fix_rest}" >>"$mv_list"
+      moved_analysis=$((moved_analysis + 1))
+      continue
+    fi
     case "$rel" in
       media/*|analysis/*) skipped=$((skipped + 1)); continue ;;
     esac
-
+    if [[ "$rel" == */* ]]; then
+      top="${rel%%/*}"
+      has_nested["$top"]=1
+      printf '%s\n' "$rel" >>"$nested_list"
+      moved_analysis=$((moved_analysis + 1))
+      continue
+    fi
+    root_file["$rel"]=1
     if is_top_level_media "$rel"; then
       dest="gs://${SRC_BUCKET}/${week_prefix}/media/${rel}"
       moved_media=$((moved_media + 1))
@@ -364,8 +576,42 @@ reorganize_one() {
     printf '%s\t%s\n' "gs://${SRC_BUCKET}/${name}" "$dest" >>"$mv_list"
   done <"$list_file"
 
+  if [[ "$use_prefix_bulk" -eq 1 ]]; then
+    for top in "${!has_nested[@]}"; do
+      if [[ -n "${root_file[$top]+x}" ]]; then
+        echo "  WARN  prefix skip ${top}/ (also a root object name); using per-file mv for that tree"
+        while IFS= read -r rel; do
+          [[ "$rel" == "${top}/"* ]] || continue
+          printf '%s\t%s\n' \
+            "gs://${SRC_BUCKET}/${week_prefix}/${rel}" \
+            "gs://${SRC_BUCKET}/${week_prefix}/analysis/${rel}" >>"$mv_list"
+        done <"$nested_list"
+        continue
+      fi
+      rc=0
+      reorganize_prefix_move "$week_prefix" "$top" || rc=$?
+      if [[ "$rc" -eq 2 ]]; then
+        while IFS= read -r rel; do
+          [[ "$rel" == "${top}/"* ]] || continue
+          printf '%s\t%s\n' \
+            "gs://${SRC_BUCKET}/${week_prefix}/${rel}" \
+            "gs://${SRC_BUCKET}/${week_prefix}/analysis/${rel}" >>"$mv_list"
+        done <"$nested_list"
+      elif [[ "$rc" -ne 0 ]]; then
+        fail=1
+      fi
+    done
+  else
+    while IFS= read -r rel; do
+      [[ -n "$rel" ]] || continue
+      printf '%s\t%s\n' \
+        "gs://${SRC_BUCKET}/${week_prefix}/${rel}" \
+        "gs://${SRC_BUCKET}/${week_prefix}/analysis/${rel}" >>"$mv_list"
+    done <"$nested_list"
+  fi
+
   if [[ -s "$mv_list" ]]; then
-    local nlines workers chunk_dir cf fail=0 pid pids=()
+    local nlines workers chunk_dir cf pid pids=()
     nlines="$(wc -l <"$mv_list" | tr -d ' ')"
     workers="$REORG_PARALLEL"
     [[ "$nlines" -lt "$workers" ]] && workers="$nlines"
@@ -374,7 +620,7 @@ reorganize_one() {
     rm -rf "$chunk_dir"
     mkdir -p "$chunk_dir"
     split -n "l/$workers" "$mv_list" "$chunk_dir/chunk_"
-    echo "  INFO  reorganize mv: ${nlines} object(s), ${workers} worker(s)"
+    echo "  INFO  reorganize file mv: ${nlines} object(s), ${workers} chunk(s), backend=${REORG_BACKEND}"
     for cf in "$chunk_dir"/chunk_*; do
       [[ -f "$cf" ]] || continue
       reorganize_mv_chunk "$cf" &
@@ -384,10 +630,12 @@ reorganize_one() {
       wait "$pid" || fail=1
     done
     rm -rf "$chunk_dir"
-    if [[ "$fail" -ne 0 ]]; then
-      echo "  FAIL  one or more gcloud storage mv operations failed"
-      return 1
-    fi
+  fi
+  rm -f "$nested_list"
+
+  if [[ "$fail" -ne 0 ]]; then
+    echo "  FAIL  one or more reorganize move operations failed"
+    return 1
   fi
 
   echo "  reorganize: media+=${moved_media} analysis+=${moved_analysis} skipped_already=${skipped}"
@@ -590,10 +838,93 @@ compare_manifests() {
   return 1
 }
 
+# Archive without local disk: snapshot STANDARD (MD5 metadata) → rsync → STANDARD ↔ ARCHIVE → delete STANDARD.
+archive_one_gcs() {
+  local expected="$1"
+  local job_dir="$2"
+  local week_prefix="${PREFIX}/${expected}"
+  local src_uri="gs://${SRC_BUCKET}/${week_prefix}"
+  local dst_uri="gs://${DST_BUCKET}/${week_prefix}"
+  local src_man="${job_dir}/archive_src.manifest"
+  local src_csv="${job_dir}/archive_src.csv"
+  local dst_man="${job_dir}/archive_dst.manifest"
+  local dst_csv="${job_dir}/archive_dst.csv"
+
+  mkdir -p "$job_dir"
+  echo "  INFO  archive pipeline (gcs-only): snapshot STANDARD → rsync → MD5 STANDARD↔ARCHIVE → delete STANDARD"
+
+  echo "  INFO  snapshot STANDARD manifest ${src_uri}/"
+  if ! build_gcs_prefix_manifest "$SRC_BUCKET" "$week_prefix" "$src_man" "$src_csv"; then
+    echo "  FAIL  could not list STANDARD objects"
+    return 1
+  fi
+  local src_n
+  src_n="$(wc -l <"$src_man" | tr -d ' ')"
+  if [[ "$src_n" -eq 0 ]]; then
+    echo "  INFO  STANDARD empty — checking ARCHIVE ${dst_uri}/"
+    if ! build_gcs_prefix_manifest "$DST_BUCKET" "$week_prefix" "$dst_man" "$dst_csv"; then
+      echo "  FAIL  could not list ARCHIVE objects"
+      return 1
+    fi
+    local dst_n
+    dst_n="$(wc -l <"$dst_man" | tr -d ' ')"
+    if [[ "$dst_n" -eq 0 ]]; then
+      echo "  FAIL  both STANDARD and ARCHIVE are empty for ${expected}"
+      return 1
+    fi
+    printf 'ARCHIVE_GCS_ONLY files=%s standard=0 archive=%s dst=%s skipped=already_archived\n' \
+      "$dst_n" "$dst_n" "$dst_uri" >"${job_dir}/archive_status.txt"
+    echo "  OK    STANDARD empty; ARCHIVE has ${dst_n} object(s) — nothing to copy or delete"
+    return 0
+  fi
+
+  echo "  INFO  STANDARD objects=${src_n}"
+  echo "  INFO  rsync copy ${src_uri}/ -> ${dst_uri}/ (parallel gcloud transfer)"
+  if ! gcloud storage rsync --recursive --continue-on-error "${src_uri}" "${dst_uri}"; then
+    echo "  FAIL  archive rsync copy failed — STANDARD left untouched"
+    return 1
+  fi
+
+  echo "  INFO  snapshot ARCHIVE manifest ${dst_uri}/"
+  if ! build_gcs_prefix_manifest "$DST_BUCKET" "$week_prefix" "$dst_man" "$dst_csv"; then
+    echo "  FAIL  could not list ARCHIVE objects — STANDARD left untouched"
+    return 1
+  fi
+
+  echo "  INFO  verifying STANDARD ↔ ARCHIVE (MD5 metadata) before delete..."
+  if ! compare_manifests "$src_man" "$dst_man" "STANDARD" "ARCHIVE"; then
+    echo "  FAIL  STANDARD ↔ ARCHIVE verification failed — STANDARD NOT deleted (safe to retry)"
+    return 1
+  fi
+
+  echo "  INFO  STANDARD↔ARCHIVE PASS — deleting STANDARD ${src_uri}/"
+  if ! gcloud storage rm --recursive --continue-on-error "${src_uri}/**"; then
+    echo "  FAIL  ARCHIVE matches STANDARD but STANDARD delete failed"
+    echo "  INFO  data is safe in ARCHIVE; clean STANDARD manually or re-run --phases archive --gcs-only"
+    return 1
+  fi
+  local left
+  left="$(gcloud storage objects list "${src_uri}/**" --format='value(name)' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$left" != "0" ]]; then
+    echo "  FAIL  STANDARD still has ${left} object(s) after delete"
+    return 1
+  fi
+
+  printf 'ARCHIVE_GCS_ONLY files=%s standard=%s archive=%s dst=%s\n' \
+    "$src_n" "$src_n" "$(wc -l <"$dst_man" | tr -d ' ')" "$dst_uri" \
+    >"${job_dir}/archive_status.txt"
+  echo "  OK    ARCHIVE MD5 VERIFIED: STANDARD ↔ ARCHIVE (${src_n} file(s)); STANDARD removed"
+  return 0
+}
+
 archive_one() {
   local expected="$1"
   local job_dir="$2"
   local local_abs="$3"
+  if [[ "${GCS_ONLY:-0}" -eq 1 ]]; then
+    archive_one_gcs "$expected" "$job_dir"
+    return $?
+  fi
   local week_prefix="${PREFIX}/${expected}"
   local src_uri="gs://${SRC_BUCKET}/${week_prefix}"
   local dst_uri="gs://${DST_BUCKET}/${week_prefix}"
@@ -725,10 +1056,19 @@ process_one() {
   fi
 
   if [[ "$want_archive" -eq 1 ]]; then
-    echo "[archive] -> gs://${DST_BUCKET}/${PREFIX}/${expected}/ (copy + LOCAL↔ARCHIVE MD5 + delete STANDARD)" | tee -a "$job_log"
+    if [[ "${GCS_ONLY:-0}" -eq 1 ]]; then
+      echo "[archive] -> gs://${DST_BUCKET}/${PREFIX}/${expected}/ (gcs-only: rsync + STANDARD↔ARCHIVE MD5 + delete STANDARD)" | tee -a "$job_log"
+    else
+      echo "[archive] -> gs://${DST_BUCKET}/${PREFIX}/${expected}/ (copy + LOCAL↔ARCHIVE MD5 + delete STANDARD)" | tee -a "$job_log"
+    fi
     if ! archive_one "$expected" "$job_dir" "$local_abs" 2>&1 | tee -a "$job_log"; then
-      echo "FAIL ${expected} archive (LOCAL↔ARCHIVE MD5 gate)"
-      append_result FAIL "$local_rel" "$expected" "archive_local_md5"
+      if [[ "${GCS_ONLY:-0}" -eq 1 ]]; then
+        echo "FAIL ${expected} archive (STANDARD↔ARCHIVE MD5 gate)"
+        append_result FAIL "$local_rel" "$expected" "archive_gcs_md5"
+      else
+        echo "FAIL ${expected} archive (LOCAL↔ARCHIVE MD5 gate)"
+        append_result FAIL "$local_rel" "$expected" "archive_local_md5"
+      fi
       return 1
     fi
     local astat=""
@@ -746,12 +1086,13 @@ process_one() {
 }
 
 export -f log die is_top_level_media b64md5_to_hex append_result
-export -f reorganize_mv_chunk reorganize_one build_local_mapped_manifest verify_one
-export REORG_PARALLEL
+export -f reorganize_mv_chunk_gcloud reorganize_mv_chunk_api reorganize_mv_chunk
+export -f reorganize_prefix_move reorganize_one build_local_mapped_manifest verify_one
+export REORG_PARALLEL REORG_BACKEND REORG_API_THREADS
 export -f build_gcs_prefix_manifest compare_manifests
-export -f archive_one process_one
+export -f archive_one_gcs archive_one process_one
 export SRC_BUCKET DST_BUCKET PREFIX BASE LOG_DIR RESULTS_OK RESULTS_FAIL RESULTS_LOCK
-export MEDIA_EXT_REGEX want_reorganize want_verify want_archive PHASES
+export MEDIA_EXT_REGEX want_reorganize want_verify want_archive PHASES GCS_ONLY
 export GOOGLE_APPLICATION_CREDENTIALS CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
 export CLOUDSDK_CORE_DISABLE_PROMPTS CLOUDSDK_CORE_PROJECT
 export CLOUDSDK_STORAGE_PROCESS_COUNT CLOUDSDK_STORAGE_THREAD_COUNT
